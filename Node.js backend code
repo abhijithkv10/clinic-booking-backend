@@ -1,0 +1,215 @@
+require("dotenv").config();
+const express   = require("express");
+const cors      = require("cors");
+const session   = require("express-session");
+const cron      = require("node-cron");
+const connectDB = require("./config/db");
+const passport  = require("./passport");
+
+/* ROUTES */
+const authRoutes            = require("./routes/authRoutes");
+const googleAuthRoutes      = require("./routes/googleAuthRoutes");
+const doctorRoutes          = require("./routes/doctorRoutes");
+const profileRoutes         = require("./routes/profileRoutes");
+const slotRoutes            = require("./routes/slotRoutes");
+const statisticsRoutes      = require("./routes/statisticsRoutes");
+const adminRoutes           = require("./routes/admin");
+const clinicPublicRoutes    = require("./routes/clinicPublicRoutes");
+const feeConfigRoutes       = require("./routes/feeConfigRoutes");
+const specializationRoutes  = require("./routes/Specializationroutes.js");
+const bookingRoutes         = require("./routes/bookingRoutes");
+const paymentRoutes         = require("./routes/paymentRoutes");   // ← NEW
+
+/* SLOT CONTROLLER — for cron + startup */
+const { autoGenerateSlotsCore } = require("./controllers/slotController");
+
+/* PAYMENT CONTROLLER — for transfer release cron */
+const { releaseOnHoldTransfers } = require("./controllers/paymentController");
+const webpush          = require("web-push");
+const ratingRoutes     = require("./routes/ratingRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
+const Booking          = require("./models/Booking");
+const PushSubscription = require("./models/PushSubscription");
+
+const app = express();
+
+// ─── VAPID setup ─────────────────────────────────────────────────────────────
+// One-time key generation: node -e "const w=require('web-push');const k=w.generateVAPIDKeys();console.log(k)"
+// Add to .env: VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_MAILTO
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_MAILTO || "mailto:support@findmycliniq.com",
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORTANT: Razorpay webhook needs the RAW request body (not parsed JSON)
+// so we capture it BEFORE app.use(express.json()).
+// ─────────────────────────────────────────────────────────────────────────────
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  (req, res, next) => {
+    // Make the raw body string available to the webhook handler
+    req.rawBody = req.body.toString("utf8");
+    next();
+  },
+  paymentRoutes
+);
+
+// ── Standard middleware ───────────────────────────────────────────────────────
+const allowedOrigins = process.env.CORS_ORIGINS.split(",");
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow Postman, mobile apps, server-to-server calls
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS blocked: Origin not allowed"));
+    }
+  },
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.use(express.json());
+
+// Session required for Passport
+app.use(
+  session({
+    secret: "googleauth",
+    resave: false,
+    saveUninitialized: false,
+  })
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Static uploads
+app.use("/uploads", express.static("uploads"));
+
+connectDB();
+
+// ── API routes ────────────────────────────────────────────────────────────────
+app.use("/api/auth",            authRoutes);
+app.use("/api/google-auth",     googleAuthRoutes);
+app.use("/api/doctors",         doctorRoutes);
+app.use("/api/clinic/profile",  profileRoutes);
+app.use("/api/slots",           slotRoutes);
+app.use("/api/statistics",      statisticsRoutes);
+app.use("/api/admin",           adminRoutes);
+app.use("/api/clinics",         clinicPublicRoutes);
+app.use("/api/fee-config",      feeConfigRoutes);
+app.use("/api/specializations", specializationRoutes);
+app.use("/api/bookings",        bookingRoutes);
+app.use("/api/payments",        paymentRoutes);   // ← NEW (all routes except /webhook already handled above)
+app.use("/api/ratings",         ratingRoutes);
+app.use("/api/notifications",   notificationRoutes);
+
+app.get("/", (req, res) => {
+  res.send("FindMyCliniQ API Running 🚀");
+});
+
+// ─── Shared slot-generation runner ───────────────────────────────────────────
+async function runSlotGeneration(label) {
+  const now = new Date().toISOString();
+  console.log("\n⏰ [" + label + " " + now + "] Running slot auto-generation…");
+  try {
+    const total = await autoGenerateSlotsCore();
+    console.log("✅ [" + label + "] Done — " + total + " new slots created\n");
+  } catch (err) {
+    console.error("❌ [" + label + "] Slot generation failed:", err.message);
+  }
+}
+
+// ─── Push notification cron job ───────────────────────────────────────────────
+// Runs every minute. Finds bookings where slot+5min fell in the last 1-minute
+// window, user hasn't rated and hasn't dismissed — sends a push to their device.
+async function runPushNotifications() {
+  try {
+    const now = new Date();
+    const lo  = new Date(now.getTime() - 6 * 60 * 1000); // 6 min ago
+    const hi  = new Date(now.getTime() - 5 * 60 * 1000); // 5 min ago
+
+    const bookings = await Booking.find({
+      userType:        "registered",
+      status:          { $ne: "cancelled" },
+      hasRated:        { $ne: true },
+  ratingDismissed: { $ne: true },
+    });
+
+    const due = bookings.filter((b) => {
+      const [h, m] = b.time.split(":").map(Number);
+      const trigger = new Date(b.date);
+      trigger.setHours(h, m + 5, 0, 0);
+      return trigger >= lo && trigger <= hi;
+    });
+
+    for (const booking of due) {
+      const subs = await PushSubscription.find({ userId: booking.userId });
+      if (!subs.length) continue;
+
+      const payload = JSON.stringify({
+        title: "How was your appointment?",
+        body:  `Rate your visit with Dr. ${booking.doctorName} at ${booking.clinicName}`,
+        icon:  "/icons/icon-192.png",
+        badge: "/icons/badge-72.png",
+        url:   "/my-bookings",
+      });
+
+      for (const sub of subs) {
+        try {
+          await webpush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, payload);
+        } catch (err) {
+          if (err.statusCode === 410) await PushSubscription.deleteOne({ _id: sub._id });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ Push cron error:", err.message);
+  }
+}
+
+// ─── Server start ─────────────────────────────────────────────────────────────
+// const PORT = process.env.PORT || 5000;
+
+// app.listen(PORT, function () {
+//   console.log("✅ Server running on port " + PORT);
+//   setTimeout(function () { runSlotGeneration("STARTUP"); }, 3000);
+//   cron.schedule("1 * * * *", function () { runSlotGeneration("CRON"); });
+//   console.log("📅 Slot auto-generation: on startup + every hour at :01");
+// });
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Server running on port ${PORT}`);
+
+  setTimeout(() => runSlotGeneration("STARTUP"), 3000);
+  cron.schedule("1 * * * *", () => runSlotGeneration("CRON"));
+  console.log("📅 Slot auto-generation: on startup + every hour at :01");
+
+  // Transfer release cron — runs every hour at :30
+  // Finds bookings with on_hold transfers where paidAt >= 6 days ago
+  // and releases them so the consultation fee goes to the clinic account
+  cron.schedule("30 * * * *", async () => {
+    console.log("\n⏰ [TRANSFER RELEASE CRON] Checking for on-hold transfers to release…");
+    try {
+      await releaseOnHoldTransfers();
+    } catch (err) {
+      console.error("❌ [TRANSFER RELEASE CRON] Error:", err.message);
+    }
+  });
+  console.log("💸 Transfer release cron: every hour at :30 (releases after 6 days)");
+
+  // Push notification cron — every minute
+  if (process.env.VAPID_PUBLIC_KEY) {
+    cron.schedule("* * * * *", runPushNotifications);
+    console.log("🔔 Push notification cron: every minute");
+  }
+});
